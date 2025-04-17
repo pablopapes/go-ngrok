@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -24,23 +25,108 @@ type NgrokResponse struct {
 	Tunnels []NgrokTunnel `json:"tunnels"`
 }
 
-func goDotEnvVariable(key string) string {
-
-	err := godotenv.Load("./.env")
-
-	if err != nil {
-		log.Fatalf("Error loading .env file")
-	}
-
-	return os.Getenv(key)
+type publicUrl struct {
+	Url string `json:"url"`
 }
 
-func main() {
+func NewConfig() (publicUrl, error) {
+	var cf publicUrl
+	confFile, err := os.Open("./config.json")
 
-	api_url := goDotEnvVariable("API_URL")
-	username := goDotEnvVariable("USERNAME_API")
-	password := goDotEnvVariable("PASSWORD_API")
+	if err != nil {
+		if os.IsNotExist(err) {
+			defaultConfig := publicUrl{
+				Url: "",
+			}
+			configFile, err := os.Create("./config.json")
+			if err != nil {
+				return cf, err
+			}
+			defer configFile.Close()
 
+			encoder := json.NewEncoder(configFile)
+			if err := encoder.Encode(&defaultConfig); err != nil {
+				return cf, err
+			}
+
+			// Reopen the newly created file
+			confFile, err = os.Open("./config.json")
+			if err != nil {
+				return cf, err
+			}
+		} else {
+			log.Fatal(err)
+		}
+	}
+
+	defer confFile.Close()
+
+	jsonParser := json.NewDecoder(confFile)
+	if err := jsonParser.Decode(&cf); err != nil {
+		return cf, err
+	}
+
+	return cf, nil
+}
+
+func updateConfigFile(urlAddress string) {
+	cfg, err := NewConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cfg.Url = urlAddress
+
+	file, err := json.MarshalIndent(cfg, "", " ")
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = os.WriteFile("./config.json", file, 0644)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func runOnce() {
+
+	api_url := os.Getenv("API_URL")
+	username := os.Getenv("USERNAME_API")
+	password := os.Getenv("PASSWORD_API")
+
+	ngrokResp, err := http.Get("http://127.0.0.1:4040/api/tunnels")
+	if err != nil {
+		panic("Error ngrok: " + err.Error())
+	}
+	defer ngrokResp.Body.Close()
+
+	ngrokBody, _ := io.ReadAll(ngrokResp.Body)
+	var tunnels NgrokResponse
+	json.Unmarshal(ngrokBody, &tunnels)
+
+	if len(tunnels.Tunnels) == 0 {
+		panic("The ngrok tunnel is not running")
+	}
+
+	publicURL := tunnels.Tunnels[0].PublicURL
+	fmt.Println("Public ngrok url:", publicURL)
+
+	// Check if the URL is the same as in the config file
+	var cfg, errcf = NewConfig()
+	if errcf != nil {
+		log.Fatal(errcf)
+	}
+
+	if cfg.Url == publicURL {
+		log.Println("The url is the same. Exiting...")
+		return
+	}
+
+	updateConfigFile(publicURL)
+
+	// send Url to API
 	authPayload := map[string]string{
 		"username": username,
 		"password": password,
@@ -64,23 +150,6 @@ func main() {
 
 	fmt.Println("Token JWT success")
 
-	ngrokResp, err := http.Get("http://127.0.0.1:4040/api/tunnels")
-	if err != nil {
-		panic("Error ngrok: " + err.Error())
-	}
-	defer ngrokResp.Body.Close()
-
-	ngrokBody, _ := io.ReadAll(ngrokResp.Body)
-	var tunnels NgrokResponse
-	json.Unmarshal(ngrokBody, &tunnels)
-
-	if len(tunnels.Tunnels) == 0 {
-		panic("The ngrok tunnel is not running")
-	}
-
-	publicURL := tunnels.Tunnels[0].PublicURL
-	fmt.Println("Public ngrok url:", publicURL)
-
 	data := map[string]string{
 		"value": publicURL + "/",
 	}
@@ -99,4 +168,20 @@ func main() {
 
 	respBody, _ := io.ReadAll(resp.Body)
 	fmt.Println("Response:", string(respBody))
+}
+
+func main() {
+	if err := godotenv.Load("./.env"); err != nil {
+		log.Fatal("can't load .env")
+	}
+
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+
+	runOnce()
+
+	// Loop
+	for range ticker.C {
+		runOnce()
+	}
 }
